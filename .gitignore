@@ -1,0 +1,17 @@
+
+# build trees — never committed
+shim/build/
+shim/build-release/
+shim/build-debug/
+
+# model weights — symlinks into the HF cache, not artifacts of this repo
+models/
+*.gguf
+
+# private planning and working notes
+QUANTA_ROADMAP.md
+QUANTA_ROADMAP.pdf
+Notes and Commands/
+
+# editor
+.vscode/
