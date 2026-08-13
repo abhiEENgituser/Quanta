@@ -13,7 +13,7 @@ int main() {
     const char * model_path = "/home/een/Abhishek/Learning/Projects/Quanta/models/qwen2.5-0.5b-q4km.gguf";
     const std::string prompt = "The capital of France is";
     const int n_ctx = 2048;          // KV cache size Limit in tokens (Max token model can hold in attention window at once)
-    const int n_decode_steps = 25;  
+    const int n_decode_steps = 100;  
 
     llama_backend_init();
 
