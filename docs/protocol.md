@@ -1,9 +1,8 @@
 # Protocol
 
 The llama.cpp API surface this project depends on, and the shim contract built on top of it.
-This file grows with each phase — Phase 0 documents the memory-management API discovered while
-designing the `Backend` interface; Phase 1 will add the wire protocol between `quantad` and
-`shim/src/main.cpp`.
+Phase 0 documents the memory-management API discovered while designing the `Backend` interface;
+Phase 1 defines the wire protocol between `quantad` and `shim/src/main.cpp`.
 
 Source of truth: `shim/vendor/llama.cpp/include/llama.h` at tag **`b10121`**
 (commit `555881ebc8b0fc0402b30e09258a32a7bfd13c52`). Every signature below was read from that
@@ -11,6 +10,189 @@ file directly, not from memory or online tutorials — several of which still sh
 function names (`llama_load_model_from_file`, `llama_new_context_with_model`, etc.).
 
 ---
+
+# Part 1 — The shim wire protocol (Phase 1)
+
+The contract between `quantad` (Go) and `shim/src/main.cpp`. Both sides implement against this
+document; neither side's behaviour is the specification.
+
+## Transport
+
+A **Unix domain socket**, not TCP. There is no network involved, so a network stack would add
+latency, a port to collide on, and an attack surface for nothing in return. Filesystem
+permissions become the access control.
+
+**One connection, strictly synchronous.** `quantad` sends a request and reads exactly one
+response before sending anything else. The shim handles a single connection with a blocking
+accept loop — no threads, no `poll`, no concurrency of any kind. This is not a simplification to
+be revisited later: it is what keeps the shim a dumb executor. Concurrency in the shim would mean
+the shim deciding what runs when, which is the scheduler's job.
+
+## Framing
+
+```
+[4-byte length, little-endian, unsigned][JSON body]
+```
+
+The length counts **the JSON body only** — it does not include the 4 prefix bytes.
+
+Framing exists because a stream socket has no message boundaries. `read()` returns whatever
+bytes happen to have arrived: half a message, two messages, or one and a half. Without an
+explicit length there is no way to know where one message ends.
+
+**Both sides must loop on read and write.** A single `read()` may return fewer bytes than asked
+for, and a single `write()` may accept fewer bytes than offered — even on a local socket, even
+for small messages. In Go use `io.ReadFull`; in C++ loop until the requested count is satisfied
+or the peer closes. Treating a short read as a complete message is the classic socket bug and
+presents as JSON parse failures under load rather than at rest.
+
+**Maximum frame size: 8 MiB.** A length prefix larger than this is a protocol violation — close
+the connection rather than attempting to allocate. An attacker-controlled or corrupted length is
+otherwise an allocation of arbitrary size.
+
+## Envelope
+
+Every request carries an `op`. Field names are `snake_case`. Unknown fields must be **ignored**,
+not rejected, so one side can add a field before the other consumes it.
+
+Every response carries `ok`:
+
+```json
+{"ok": true,  ...payload}
+{"ok": false, "error": "human-readable description"}
+```
+
+The distinction that matters is **whether the stream position is still trustworthy**, because that
+decides whether the connection can continue:
+
+| Condition | Response |
+|---|---|
+| Valid frame, body is not valid JSON | `ok: false` — keep the connection |
+| Valid JSON, unknown `op` | `ok: false` — keep the connection |
+| Valid `op`, engine call failed | `ok: false` — keep the connection |
+| Length prefix exceeds `MAX_FRAME` | **close** — the length is untrustworthy, so the next frame boundary is unknown |
+| EOF or error mid-frame | **close** — the peer is gone or the stream is truncated |
+
+A malformed *body* is recoverable: the length prefix already established where the message ended,
+so the next frame starts exactly where expected. Only a bad *length* desynchronises the stream,
+because after that there is no way to know where one message stops and the next begins.
+
+## Messages
+
+### `tokenize`
+
+```json
+→ {"op":"tokenize","text":"The capital of France is","add_special":true}
+← {"ok":true,"tokens":[791,6864,315,9822,374]}
+```
+
+Deliberately separate from `prefill`, because Go needs the prompt's token count to make an
+admission decision *before* committing any KV memory. If the shim tokenized implicitly during
+prefill, that number would never reach the scheduler.
+
+`add_special` controls BOS/EOS insertion. `parse_special` is not exposed — the shim always passes
+`true`, since text arriving from a client should have special-token markup interpreted
+consistently.
+
+### `prefill`
+
+```json
+→ {"op":"prefill","seq":0,"tokens":[791,6864,315,9822,374],"start_pos":0}
+← {"ok":true}
+```
+
+Submits tokens for one sequence in a single `llama_decode` call, requesting logits **only for the
+final token** — the model computes hidden states for every position regardless, but materializing
+a vocabulary-sized logits vector for a position whose prediction is discarded is wasted work.
+
+`start_pos` exists so that a long prompt can be submitted in several `prefill` calls at
+increasing positions. That is chunked prefill (Phase 3), and having the field now means the
+protocol does not change to support it.
+
+### `step`
+
+```json
+→ {"op":"step","active":[0]}
+← {"ok":true,"tokens":[{"seq":0,"id":12366,"piece_b64":"IFBhcmlz","finished":false}]}
+```
+
+Advances **exactly one decode pass** across the listed sequences. Go decides who is in `active`
+and when to call; the shim never chooses.
+
+`active` is an array even though Phase 1 only ever sends one sequence. Phase 3 needs multiple,
+and widening the wire format later means changing both implementations at once.
+
+`tokens` is an **array, not a map keyed by sequence id** — JSON object keys are strings, which
+would force a string-to-int conversion on the Go side for no benefit.
+
+`piece_b64` is base64 of the **raw bytes** from `llama_token_to_piece`. Those bytes are not
+necessarily valid UTF-8: a single token can be a fragment of a multi-byte character, and JSON
+strings must be valid UTF-8, so a partial character cannot legally be sent as a JSON string at
+all. It would work on English ASCII and corrupt on anything else. Go accumulates the bytes and
+decodes complete characters itself — which it has to do regardless, since an SSE frame must not
+carry a split character either.
+
+`finished` means **the engine emitted an end-of-generation token** (`llama_vocab_is_eog`) and
+nothing else. Maximum output length, timeouts, and cancellation are policy, so they belong to Go.
+A shim that stopped a sequence because it hit some length limit would be making a scheduling
+decision.
+
+On a failed decode, the raw return code is passed through:
+
+```json
+← {"ok":false,"error":"llama_decode failed","decode_rc":1}
+```
+
+That distinction matters: `1` means no KV slot was available and is potentially recoverable by
+freeing memory and retrying, while `-1` means the batch itself was invalid and retrying is
+pointless. See *`llama_decode`'s own partial-failure semantics* below.
+
+### `evict`
+
+```json
+→ {"op":"evict","seq":0,"p0":0,"p1":-1}
+← {"ok":true,"removed":true}
+```
+
+Maps directly to `llama_memory_seq_rm`. Position conventions are llama.cpp's, deliberately
+unchanged so there is no translation layer to get wrong: `p0 < 0` means `[0, p1)`, `p1 < 0` means
+`[p0, ∞)`.
+
+`removed` is reported **separately from `ok`** because they answer different questions. `ok`
+means the call executed; `removed` is `seq_rm`'s own return value, meaning "was this removal
+possible." Collapsing them would discard the signal the block manager's fallback path depends on
+(see Constraint 1).
+
+In Phase 1 this is how a sequence gets reset between requests: `{"seq":0,"p0":0,"p1":-1}` clears
+it completely.
+
+## Engine state outlives the connection
+
+Sequences, their cached tokens, and their positions belong to the **shim process**, not to the
+socket connection. Disconnecting and reconnecting does not reset anything.
+
+This is deliberate — a scheduler would not want a transient connection drop to silently discard
+every in-flight sequence's KV cache. But it means the client owns cleanup: prefilling into a
+position range a sequence already occupies fails with `decode_rc: -1` (invalid batch), not with a
+helpful message about reuse. Either `evict` before reusing a sequence id, or allocate a fresh one.
+
+## Not in Phase 1
+
+`fork` (prefix sharing via `seq_cp`) and `pos_range` (bookkeeping verification via
+`pos_min`/`pos_max`) are part of the `Backend` interface but are not needed until Phase 4. They
+are omitted rather than stubbed — an unimplemented message that returns success is worse than one
+that does not exist.
+
+## Naming note
+
+The roadmap's Phase 1 task list calls the second message `admit`. This document uses `prefill`,
+matching the `Backend` interface. *Admission* is a decision Go makes — whether to start a request
+at all. Naming a shim message after a policy it does not own invites someone later to put policy
+behind it.
+
+---
+
+# Part 2 — llama.cpp API surface (Phase 0)
 
 ## The six `llama_memory_*` signatures the `Backend` interface is built on
 

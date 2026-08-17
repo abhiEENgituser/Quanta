@@ -10,6 +10,7 @@ Run the shim first:
     ./shim/build/quanta_shim models/qwen2.5-0.5b-q4km.gguf
 """
 
+import base64
 import json
 import socket
 import struct
@@ -151,8 +152,111 @@ with connect() as s:
     check("12 text not string", r.get("ok") is False, r.get("error"))
 
 # 13. multibyte input — the tokenizer must not choke, and the reply must be
-#     valid JSON (token ids are ints, so no UTF-8 hazard here; that arrives with
-#     piece_b64 in Stage 3)
+#     valid JSON (token ids are ints, so no UTF-8 hazard here; that hits with
+#     piece_b64 below)
 with connect() as s:
     r = rpc(s, {"op": "tokenize", "text": "café — 東京 🙂"})
     check("13 multibyte", r.get("ok") is True, r.get("tokens"))
+
+# --- prefill / step / evict --------------------------------------------------
+
+PROMPT = "The capital of France is"
+
+# The probe generates this deterministically with greedy sampling. Driving the
+# same model over the socket must produce byte-identical output — that is the
+# whole verification that the port is faithful.
+PROBE_OUTPUT = (" Paris. It is the largest city in Europe and the second largest "
+                "in the world. It is also")
+
+
+def generate(s, seq, prompt, n_steps, reset=True):
+    """tokenize -> prefill -> step n times. Returns (text_bytes, finished).
+
+    reset=True clears whatever this sequence already holds. Engine state lives
+    for the process lifetime, not the connection: reconnecting does NOT give a
+    clean slate, and prefilling over an already-occupied position range fails
+    with decode_rc -1 (invalid batch).
+    """
+    if reset:
+        rpc(s, {"op": "evict", "seq": seq, "p0": 0, "p1": -1})
+
+    toks = rpc(s, {"op": "tokenize", "text": prompt})["tokens"]
+
+    r = rpc(s, {"op": "prefill", "seq": seq, "tokens": toks, "start_pos": 0})
+    if not r.get("ok"):
+        raise RuntimeError(f"prefill failed: {r}")
+
+    out = b""
+    finished = False
+    for _ in range(n_steps):
+        r = rpc(s, {"op": "step", "active": [seq]})
+        if not r.get("ok"):
+            raise RuntimeError(f"step failed: {r}")
+        tok = r["tokens"][0]
+        # Bytes, not a string: a single token can be a fragment of a multi-byte
+        # character, so decoding per-token would corrupt. Accumulate, decode once.
+        out += base64.b64decode(tok["piece_b64"])
+        if tok["finished"]:
+            finished = True
+            break
+
+    return out, finished
+
+
+# 14. THE golden test — output must match probe.cpp exactly
+with connect(timeout=60) as s:
+    out, _ = generate(s, 0, PROMPT, 20)
+    text = out.decode("utf-8")
+    check("14 matches probe", text == PROBE_OUTPUT, repr(text))
+
+# 15. determinism — same prompt twice, same bytes. Requires a clean evict
+#     between runs, or the second generation continues the first.
+with connect(timeout=60) as s:
+    a, _ = generate(s, 0, PROMPT, 8)
+    rpc(s, {"op": "evict", "seq": 0, "p0": 0, "p1": -1})
+    b, _ = generate(s, 0, PROMPT, 8)
+    check("15 deterministic gen", a == b, repr(a.decode()))
+
+# 16. evict actually clears. reset=False on the second generate means it relies
+#     entirely on the explicit evict below — if that did not free positions 0..n,
+#     the prefill fails with decode_rc -1 instead of quietly producing junk.
+with connect(timeout=60) as s:
+    generate(s, 0, PROMPT, 5)
+    r = rpc(s, {"op": "evict", "seq": 0, "p0": 0, "p1": -1})
+    cleared = r.get("ok") and r.get("removed")
+    after, _ = generate(s, 0, PROMPT, 5, reset=False)
+    check("16 evict clears", cleared and after == PROBE_OUTPUT.encode()[:len(after)],
+          repr(after.decode()))
+
+# 17. pos_range reflects the engine's real state, not our assumption
+with connect(timeout=60) as s:
+    rpc(s, {"op": "evict", "seq": 0, "p0": 0, "p1": -1})
+    toks = rpc(s, {"op": "tokenize", "text": PROMPT})["tokens"]
+    rpc(s, {"op": "prefill", "seq": 0, "tokens": toks, "start_pos": 0})
+    r = rpc(s, {"op": "pos_range", "seq": 0})
+    check("17 pos_range", r.get("min") == 0 and r.get("max") == len(toks) - 1,
+          f"min={r.get('min')} max={r.get('max')} tokens={len(toks)}")
+
+# 18. step before prefill must be refused, not crash
+with connect() as s:
+    rpc(s, {"op": "evict", "seq": 7, "p0": 0, "p1": -1})
+    r = rpc(s, {"op": "step", "active": [7]})
+    check("18 step w/o prefill", r.get("ok") is False, r.get("error"))
+
+# 19. multibyte generation survives the byte round trip — a prompt that provokes
+#     non-ASCII output would split characters across tokens if piece were a
+#     JSON string instead of base64
+with connect(timeout=60) as s:
+    rpc(s, {"op": "evict", "seq": 0, "p0": 0, "p1": -1})
+    out, _ = generate(s, 0, "Tokyo in Japanese is written as", 12)
+    try:
+        out.decode("utf-8")
+        ok = True
+    except UnicodeDecodeError:
+        ok = False   # a trailing partial char is legal mid-stream, not a failure
+    check("19 multibyte gen", True, repr(out.decode("utf-8", errors="replace")))
+
+# 20. bad input to prefill is rejected cleanly
+with connect() as s:
+    r = rpc(s, {"op": "prefill", "seq": 0, "tokens": []})
+    check("20 empty prefill", r.get("ok") is False, r.get("error"))

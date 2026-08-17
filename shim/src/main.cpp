@@ -1,12 +1,11 @@
 // quanta_shim: unix socket server that bridges quantad to llama.cpp.
 //
-// Stage 2 — framing + JSON dispatch + tokenize. Model and vocab are loaded, but
-// no context and no decoding yet: prefill/step arrive in Stage 3.
+// Step C — framing + JSON dispatch + tokenize/prefill/step/evict.
 //
 // Wire format (see docs/protocol.md):
 //   [4-byte length, little-endian, unsigned][JSON body]
 //
-// Usage: quanta_shim <model.gguf> [socket_path]
+// Usage: quanta_shim -m <model.gguf> [-s socket_path] [-c n_ctx]
 
 #include "llama.h"
 
@@ -17,8 +16,10 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/socket.h>
@@ -32,9 +33,11 @@ using json = nlohmann::json;
 static const uint32_t MAX_FRAME = 8u * 1024 * 1024;
 
 static const char * DEFAULT_SOCKET_PATH = "/tmp/quanta.sock";
+static const int    DEFAULT_N_CTX       = 2048;
 
 // ---------------------------------------------------------------------------
-// Framing (unchanged from Stage 1)
+// Framing — proven in step A. Do not change without re-running the conformance
+// tests in Testing/quanta_shim_client.py.
 // ---------------------------------------------------------------------------
 
 // Read exactly n bytes, or fail. A single read() may return fewer bytes than
@@ -133,16 +136,77 @@ static bool write_frame(int fd, const std::string & body) {
 }
 
 // ---------------------------------------------------------------------------
-// Engine state — loaded once at startup, shared by every request
+// base64 — token text crosses the wire as raw bytes, because a single token can
+// be a fragment of a multi-byte character and JSON strings must be valid UTF-8.
+// Confirmed in practice: "café — 東京 🙂" produces byte-fallback pieces that are
+// not valid UTF-8 on their own.
 // ---------------------------------------------------------------------------
+
+static std::string base64_encode(const uint8_t * data, size_t len) {
+    static const char * tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+
+    for (size_t i = 0; i < len; i += 3) {
+        const uint32_t a = data[i];
+        const uint32_t b = (i + 1 < len) ? data[i + 1] : 0u;
+        const uint32_t c = (i + 2 < len) ? data[i + 2] : 0u;
+
+        const uint32_t triple = (a << 16) | (b << 8) | c;
+
+        out.push_back(tbl[(triple >> 18) & 0x3f]);
+        out.push_back(tbl[(triple >> 12) & 0x3f]);
+        out.push_back((i + 1 < len) ? tbl[(triple >> 6) & 0x3f] : '=');
+        out.push_back((i + 2 < len) ? tbl[ triple       & 0x3f] : '=');
+    }
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Engine state
+// ---------------------------------------------------------------------------
+
+struct seq_state {
+    llama_pos next_pos   = 0;   // absolute position the next token will occupy
+    int32_t   logits_idx = -1;  // output index holding this sequence's pending logits
+    bool      prefilled  = false;
+};
 
 struct engine {
     llama_model       * model = nullptr;
     const llama_vocab * vocab = nullptr;
+    llama_context     * ctx   = nullptr;
+    llama_sampler     * smpl  = nullptr;
+    llama_batch         batch = {};
+    int                 n_ctx = 0;
+
+    // The shim owns each sequence's position because building a batch requires
+    // it. Go keeps its own accounting and verifies against pos_range rather than
+    // either side trusting the other blindly (docs/protocol.md, Constraint 2).
+    std::unordered_map<llama_seq_id, seq_state> seqs;
 };
 
 static json make_error(const std::string & msg) {
     return json{{"ok", false}, {"error", msg}};
+}
+
+// Decode one token id to its raw bytes. llama_token_to_piece returns a negative
+// value when the buffer is too small — that must be checked before constructing
+// a string, or the length is garbage.
+static bool token_bytes(const engine & eng, llama_token tok, std::string & out) {
+    char buf[256];
+
+    const int32_t n = llama_token_to_piece(eng.vocab, tok, buf, sizeof(buf),
+                                           /* lstrip */ 0, /* special */ true);
+    if (n < 0) {
+        return false;   // would need -n bytes; 256 is generous for a single token
+    }
+
+    out.assign(buf, static_cast<size_t>(n));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,9 +224,9 @@ static json handle_tokenize(const engine & eng, const json & req) {
     const std::string text        = req["text"].get<std::string>();
     const bool        add_special = req.value("add_special", true);
 
-    // llama_tokenize does not tell you the token count up front. Guess a buffer
-    // (a token is never more than one per input byte, since byte-level fallback
-    // is the worst case) plus 2 for BOS/EOS, then retry if it was too small.
+    // llama_tokenize does not report the token count up front. Guess a buffer
+    // (byte-level fallback means never more than one token per input byte) plus
+    // 2 for BOS/EOS, then retry if it was too small.
     std::vector<llama_token> toks(text.size() + 2);
 
     int32_t n = llama_tokenize(eng.vocab, text.c_str(), static_cast<int32_t>(text.size()),
@@ -172,8 +236,8 @@ static json handle_tokenize(const engine & eng, const json & req) {
     if (n < 0) {
         // A too-small buffer is reported as the negated required size. INT32_MIN
         // cannot be negated without overflow — it stays negative, and resizing to
-        // it would be catastrophic. Unreachable for sane input, but `text` now
-        // arrives over a socket, so it is no longer our input to trust.
+        // it would be catastrophic. `text` arrives over a socket, so this is no
+        // longer input we control.
         if (n == INT32_MIN) {
             return make_error("tokenize: input too large to tokenize");
         }
@@ -194,16 +258,250 @@ static json handle_tokenize(const engine & eng, const json & req) {
     return json{{"ok", true}, {"tokens", toks}};
 }
 
-// echo: returns the request unchanged. Exists purely so the framing conformance
-// tests keep working as real operations are added — it touches no engine state
-// and makes no decisions.
+// prefill: submit a prompt for one sequence in a single decode pass, requesting
+// logits only for the final token. start_pos lets a long prompt be split across
+// several calls (chunked prefill) without a protocol change.
+static json handle_prefill(engine & eng, const json & req) {
+    if (!req.contains("seq") || !req["seq"].is_number_integer()) {
+        return make_error("prefill: 'seq' must be an integer");
+    }
+    if (!req.contains("tokens") || !req["tokens"].is_array()) {
+        return make_error("prefill: 'tokens' must be an array");
+    }
+
+    const llama_seq_id seq = req["seq"].get<llama_seq_id>();
+
+    std::vector<llama_token> toks;
+    for (const auto & t : req["tokens"]) {
+        if (!t.is_number_integer()) {
+            return make_error("prefill: 'tokens' must contain only integers");
+        }
+        toks.push_back(t.get<llama_token>());
+    }
+
+    if (toks.empty()) {
+        return make_error("prefill: 'tokens' must not be empty");
+    }
+
+    const llama_pos start_pos = req.value("start_pos", 0);
+    if (start_pos < 0) {
+        return make_error("prefill: 'start_pos' must be >= 0");
+    }
+    if (start_pos + static_cast<llama_pos>(toks.size()) > eng.n_ctx) {
+        return make_error("prefill: start_pos + tokens exceeds n_ctx");
+    }
+
+    // Only the final token needs logits: the model computes hidden states for
+    // every position anyway, but materialising a vocabulary-sized logits vector
+    // for a prediction we discard is wasted work.
+    eng.batch.n_tokens = static_cast<int32_t>(toks.size());
+    for (size_t i = 0; i < toks.size(); ++i) {
+        eng.batch.token[i]     = toks[i];
+        eng.batch.pos[i]       = start_pos + static_cast<llama_pos>(i);
+        eng.batch.n_seq_id[i]  = 1;
+        eng.batch.seq_id[i][0] = seq;
+        eng.batch.logits[i]    = false;
+    }
+    eng.batch.logits[toks.size() - 1] = true;
+
+    const int32_t rc = llama_decode(eng.ctx, eng.batch);
+    if (rc != 0) {
+        // Positive codes are warnings (1 = no KV slot, potentially recoverable by
+        // freeing memory); negatives are fatal. Pass the raw code through so Go
+        // can tell the difference instead of guessing.
+        json err = make_error("llama_decode failed during prefill");
+        err["decode_rc"] = rc;
+        return err;
+    }
+
+    seq_state & st = eng.seqs[seq];
+    st.next_pos  = start_pos + static_cast<llama_pos>(toks.size());
+    st.prefilled = true;
+
+    // llama_get_logits_ith() indexes by BATCH position, not by output ordinal —
+    // internally it resolves output_ids[i], which is -1 for any token that did
+    // not request logits. So this is the batch slot of the final token, and
+    // passing 0 here would resolve to -1 and return a null logits pointer.
+    st.logits_idx = static_cast<int32_t>(toks.size()) - 1;
+
+    return json{{"ok", true}};
+}
+
+// step: advance every listed sequence by exactly one decode pass. Go decides who
+// is active and when to call; the shim never chooses.
+//
+// Shape matches probe.cpp: prefill leaves logits ready, then each step samples
+// from what is available and decodes the sampled token to prepare the next.
+static json handle_step(engine & eng, const json & req) {
+    if (!req.contains("active") || !req["active"].is_array()) {
+        return make_error("step: 'active' must be an array");
+    }
+
+    std::vector<llama_seq_id> active;
+    for (const auto & s : req["active"]) {
+        if (!s.is_number_integer()) {
+            return make_error("step: 'active' must contain only integers");
+        }
+        active.push_back(s.get<llama_seq_id>());
+    }
+
+    if (active.empty()) {
+        return make_error("step: 'active' must not be empty");
+    }
+    if (static_cast<int>(active.size()) > eng.n_ctx) {
+        return make_error("step: more active sequences than batch capacity");
+    }
+
+    // Validate everything before mutating anything, so a bad request cannot leave
+    // half the sequences advanced.
+    for (const llama_seq_id seq : active) {
+        auto it = eng.seqs.find(seq);
+        if (it == eng.seqs.end() || !it->second.prefilled) {
+            return make_error("step: sequence " + std::to_string(seq) + " has not been prefilled");
+        }
+        if (it->second.logits_idx < 0) {
+            return make_error("step: sequence " + std::to_string(seq) + " has no pending logits");
+        }
+        if (it->second.next_pos >= eng.n_ctx) {
+            return make_error("step: sequence " + std::to_string(seq) + " would exceed n_ctx");
+        }
+    }
+
+    json out_tokens = json::array();
+
+    eng.batch.n_tokens = 0;
+
+    struct pending { llama_seq_id seq; int32_t idx; };
+    std::vector<pending> to_update;
+
+    for (const llama_seq_id seq : active) {
+        seq_state & st = eng.seqs[seq];
+
+        const llama_token tok = llama_sampler_sample(eng.smpl, eng.ctx, st.logits_idx);
+
+        std::string bytes;
+        if (!token_bytes(eng, tok, bytes)) {
+            return make_error("step: llama_token_to_piece needed a larger buffer");
+        }
+
+        const bool finished = llama_vocab_is_eog(eng.vocab, tok);
+
+        out_tokens.push_back(json{
+            {"seq",       seq},
+            {"id",        tok},
+            {"piece_b64", base64_encode(reinterpret_cast<const uint8_t *>(bytes.data()),
+                                        bytes.size())},
+            {"finished",  finished},
+        });
+
+        // 'finished' means the engine emitted an end-of-generation token, nothing
+        // more. Length caps, timeouts and cancellation are policy and belong to
+        // Go — a shim that stopped a sequence itself would be scheduling.
+        if (finished) {
+            st.logits_idx = -1;
+            continue;
+        }
+
+        const int32_t slot = eng.batch.n_tokens++;
+
+        eng.batch.token[slot]     = tok;
+        eng.batch.pos[slot]       = st.next_pos++;
+        eng.batch.n_seq_id[slot]  = 1;
+        eng.batch.seq_id[slot][0] = seq;
+        eng.batch.logits[slot]    = true;
+
+        // The batch slot IS the logits index — llama_get_logits_ith() resolves
+        // output_ids[slot] internally. Tracking it per sequence, rather than
+        // passing -1 for "the last output", is what makes this correct once
+        // more than one sequence is in flight.
+        to_update.push_back({seq, slot});
+    }
+
+    if (eng.batch.n_tokens > 0) {
+        const int32_t rc = llama_decode(eng.ctx, eng.batch);
+        if (rc != 0) {
+            json err = make_error("llama_decode failed during step");
+            err["decode_rc"] = rc;
+            return err;
+        }
+
+        for (const auto & p : to_update) {
+            eng.seqs[p.seq].logits_idx = p.idx;
+        }
+    }
+
+    return json{{"ok", true}, {"tokens", out_tokens}};
+}
+
+// evict: drop cached tokens for a sequence. Maps straight onto
+// llama_memory_seq_rm, keeping llama.cpp's position conventions so there is no
+// translation layer to get wrong: p0 < 0 means [0, p1), p1 < 0 means [p0, inf).
+static json handle_evict(engine & eng, const json & req) {
+    if (!req.contains("seq") || !req["seq"].is_number_integer()) {
+        return make_error("evict: 'seq' must be an integer");
+    }
+
+    const llama_seq_id seq = req["seq"].get<llama_seq_id>();
+    const llama_pos    p0  = req.value("p0", 0);
+    const llama_pos    p1  = req.value("p1", -1);
+
+    llama_memory_t mem = llama_get_memory(eng.ctx);
+
+    // 'removed' is reported separately from 'ok' because they answer different
+    // questions: ok means the call executed, removed is seq_rm's own answer to
+    // "was this removal possible".
+    const bool removed = llama_memory_seq_rm(mem, seq, p0, p1);
+
+    if (removed) {
+        auto it = eng.seqs.find(seq);
+        if (it != eng.seqs.end()) {
+            if (p0 <= 0 && p1 < 0) {
+                // Whole sequence cleared — drop our bookkeeping too, or the next
+                // prefill would continue from a stale position.
+                eng.seqs.erase(it);
+            } else {
+                // A partial evict leaves the cache in a state our cached
+                // logits_idx no longer describes. Rather than guess, invalidate:
+                // Go must prefill again before stepping this sequence.
+                it->second.logits_idx = -1;
+                if (p1 < 0 && p0 >= 0) {
+                    it->second.next_pos = p0;
+                }
+            }
+        }
+    }
+
+    return json{{"ok", true}, {"removed", removed}};
+}
+
+// pos_range: what the engine actually holds for a sequence. Not part of the
+// Phase 1 protocol, but it is the verification primitive Constraint 2 calls for
+// and it costs nothing to expose now.
+static json handle_pos_range(engine & eng, const json & req) {
+    if (!req.contains("seq") || !req["seq"].is_number_integer()) {
+        return make_error("pos_range: 'seq' must be an integer");
+    }
+
+    const llama_seq_id seq = req["seq"].get<llama_seq_id>();
+    llama_memory_t     mem = llama_get_memory(eng.ctx);
+
+    return json{
+        {"ok",  true},
+        {"min", llama_memory_seq_pos_min(mem, seq)},
+        {"max", llama_memory_seq_pos_max(mem, seq)},
+    };
+}
+
+// echo: returns the request unchanged. Exists so the framing conformance tests
+// keep working as real operations are added — it touches no engine state and
+// makes no decisions.
 static json handle_echo(const json & req) {
     json resp = req;
     resp["ok"] = true;
     return resp;
 }
 
-static json dispatch(const engine & eng, const std::string & body) {
+static json dispatch(engine & eng, const std::string & body) {
     json req;
     try {
         req = json::parse(body);
@@ -220,12 +518,12 @@ static json dispatch(const engine & eng, const std::string & body) {
     const std::string op = req["op"].get<std::string>();
 
     try {
-        if (op == "tokenize") {
-            return handle_tokenize(eng, req);
-        }
-        if (op == "echo") {
-            return handle_echo(req);
-        }
+        if (op == "tokenize")  return handle_tokenize (eng, req);
+        if (op == "prefill")   return handle_prefill  (eng, req);
+        if (op == "step")      return handle_step     (eng, req);
+        if (op == "evict")     return handle_evict    (eng, req);
+        if (op == "pos_range") return handle_pos_range(eng, req);
+        if (op == "echo")      return handle_echo     (req);
         return make_error("unknown op: " + op);
     } catch (const std::exception & e) {
         // A handler throwing must not take the process down — the connection is
@@ -238,7 +536,7 @@ static json dispatch(const engine & eng, const std::string & body) {
 // Server
 // ---------------------------------------------------------------------------
 
-static void serve_connection(const engine & eng, int conn) {
+static void serve_connection(engine & eng, int conn) {
     // Strictly synchronous: one request in, one response out, repeat until the
     // peer closes or the stream desynchronises.
     std::string body;
@@ -252,18 +550,40 @@ static void serve_connection(const engine & eng, int conn) {
     }
 }
 
+static void engine_free(engine & eng) {
+    if (eng.smpl)        llama_sampler_free(eng.smpl);
+    if (eng.batch.token) llama_batch_free(eng.batch);
+    if (eng.ctx)         llama_free(eng.ctx);
+    if (eng.model)       llama_model_free(eng.model);
+    llama_backend_free();
+}
+
 int main(int argc, char ** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf> [socket_path]\n", argv[0]);
+    const char * model_path = nullptr;
+    const char * sock_path  = DEFAULT_SOCKET_PATH;
+    int          n_ctx      = DEFAULT_N_CTX;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            model_path = argv[++i];
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            sock_path = argv[++i];
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            n_ctx = atoi(argv[++i]);
+        } else {
+            fprintf(stderr, "usage: %s -m <model.gguf> [-s socket_path] [-c n_ctx]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (model_path == nullptr || n_ctx <= 0) {
+        fprintf(stderr, "usage: %s -m <model.gguf> [-s socket_path] [-c n_ctx]\n", argv[0]);
         return 1;
     }
 
-    const char * model_path = argv[1];
-    const char * sock_path  = (argc > 2) ? argv[2] : DEFAULT_SOCKET_PATH;
-
     // Writing to a socket whose peer has closed raises SIGPIPE, which by default
     // terminates the process silently. Ignoring it makes write() return EPIPE
-    // instead, which the error paths above already handle.
+    // instead, which the error paths already handle.
     signal(SIGPIPE, SIG_IGN);
 
     // ---- load the engine before listening: a shim that cannot serve should not
@@ -272,19 +592,43 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     engine eng;
+    eng.n_ctx = n_ctx;
 
     llama_model_params model_params = llama_model_default_params();
     eng.model = llama_model_load_from_file(model_path, model_params);
     if (eng.model == nullptr) {
         fprintf(stderr, "quanta_shim: failed to load model: %s\n", model_path);
-        llama_backend_free();
+        engine_free(eng);
         return 1;
     }
 
     eng.vocab = llama_model_get_vocab(eng.model);
 
-    fprintf(stderr, "quanta_shim: model loaded (%d tokens in vocab)\n",
-            llama_vocab_n_tokens(eng.vocab));
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx   = static_cast<uint32_t>(n_ctx);
+    ctx_params.n_batch = static_cast<uint32_t>(n_ctx);
+
+    eng.ctx = llama_init_from_model(eng.model, ctx_params);
+    if (eng.ctx == nullptr) {
+        fprintf(stderr, "quanta_shim: failed to create context\n");
+        engine_free(eng);
+        return 1;
+    }
+
+    // Greedy sampling: deterministic, so the same request always yields the same
+    // tokens. That is what makes timings comparable across runs and lets output
+    // be verified against probe.cpp.
+    //
+    // One shared sampler is safe only because greedy is stateless. Any sampler
+    // with state (repetition penalty, a seeded RNG) needs one chain per sequence.
+    llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+    eng.smpl = llama_sampler_chain_init(sparams);
+    llama_sampler_chain_add(eng.smpl, llama_sampler_init_greedy());
+
+    eng.batch = llama_batch_init(n_ctx, 0, 1);
+
+    fprintf(stderr, "quanta_shim: model loaded, vocab=%d, n_ctx=%d\n",
+            llama_vocab_n_tokens(eng.vocab), n_ctx);
 
     // ---- socket setup
 
@@ -297,8 +641,7 @@ int main(int argc, char ** argv) {
     if (strlen(sock_path) >= sizeof(addr.sun_path)) {
         fprintf(stderr, "quanta_shim: socket path too long (max %zu)\n",
                 sizeof(addr.sun_path) - 1);
-        llama_model_free(eng.model);
-        llama_backend_free();
+        engine_free(eng);
         return 1;
     }
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
@@ -310,26 +653,24 @@ int main(int argc, char ** argv) {
     const int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) {
         perror("socket");
-        llama_model_free(eng.model);
-        llama_backend_free();
+        engine_free(eng);
         return 1;
     }
 
     if (bind(srv, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
         perror("bind");
         close(srv);
-        llama_model_free(eng.model);
-        llama_backend_free();
+        engine_free(eng);
         return 1;
     }
 
     // Backlog of 1: quantad is the only client, and the shim serves one
-    // connection at a time by design.
+    // connection at a time by design. Concurrency here would mean the shim
+    // deciding what runs when, which is the scheduler's job.
     if (listen(srv, 1) < 0) {
         perror("listen");
         close(srv);
-        llama_model_free(eng.model);
-        llama_backend_free();
+        engine_free(eng);
         return 1;
     }
 
@@ -354,9 +695,7 @@ int main(int argc, char ** argv) {
 
     close(srv);
     unlink(sock_path);
-
-    llama_model_free(eng.model);
-    llama_backend_free();
+    engine_free(eng);
 
     return 0;
 }
