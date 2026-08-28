@@ -1,6 +1,14 @@
 // probe: single-sequence greedy decode against llama.cpp, no common/ dependency.
+//
+// Usage: probe [-l prompt_tokens] [-n decode_steps]
+//   -l  pad/truncate the prompt to exactly this many tokens (0 = natural length).
+//       Padding tiles the natural prompt's tokens; for timing that is fine, since
+//       prefill cost depends on position count, not which tokens sit there.
+//   -n  number of decode steps (0 = prefill only).
 #include "llama.h"
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -9,11 +17,28 @@ static double ms_between(const struct timespec & t0, const struct timespec & t1)
     return (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 }
 
-int main() {
+int main(int argc, char ** argv) {
     const char * model_path = "/home/een/Abhishek/Learning/Projects/Quanta/models/qwen2.5-0.5b-q4km.gguf";
     const std::string prompt = "The capital of France is";
     const int n_ctx = 2048;          // KV cache size Limit in tokens (Max token model can hold in attention window at once)
-    const int n_decode_steps = 100;  
+
+    int n_decode_steps = 100;
+    int prompt_len     = 0;          // 0 = use the natural prompt length
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_decode_steps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
+            prompt_len = atoi(argv[++i]);
+        } else {
+            fprintf(stderr, "usage: %s [-l prompt_tokens] [-n decode_steps]\n", argv[0]);
+            return 1;
+        }
+    }
+    if (n_decode_steps < 0 || prompt_len < 0 || prompt_len + n_decode_steps > n_ctx) {
+        fprintf(stderr, "error: prompt_len + decode_steps must fit in n_ctx (%d)\n", n_ctx);
+        return 1;
+    }
 
     llama_backend_init();
 
@@ -35,6 +60,20 @@ int main() {
                                    tokens.data(), (int32_t) tokens.size(), true, true);
     }
     tokens.resize(n_tokens);
+
+    // -l: pad or truncate to exactly prompt_len tokens. Padding tiles the natural
+    // prompt's tokens. The token *values* barely matter for timing — prefill cost
+    // is driven by how many positions are processed, not which tokens they hold —
+    // but this changes what text gets generated, so -l runs are for measurement,
+    // not for verifying output against the recorded probe text.
+    if (prompt_len > 0) {
+        std::vector<llama_token> padded(prompt_len);
+        for (int i = 0; i < prompt_len; ++i) {
+            padded[i] = tokens[i % tokens.size()];
+        }
+        tokens = padded;
+        n_tokens = prompt_len;
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx   = n_ctx;

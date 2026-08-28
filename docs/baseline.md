@@ -17,29 +17,47 @@ Reference numbers for this machine. Every later performance claim gets checked a
 
 ## Numbers
 
-Source is `probe` unless noted. Machine quiet, on AC, no swap activity.
+Source is `probe`; sweep results in `bench/results/baseline_sweep_20260828.csv`, produced by
+`bench/configs/baseline_sweep.sh` (6 repeats, run 1 discarded, MHz sampled during runs).
+Machine quiet, on AC, no swap activity, `performance` governor unless noted.
 
 | Metric | Value | Sample |
 |---|---|---|
-| Decode step, batch=1, 20 tokens | **18.03 ms/step** (55.5 t/s) | n=5, spread 3.7% |
-| Decode step, batch=1, 100 tokens | **20.27 ms/step** (49.3 t/s) | n=1 |
-| Prefill, 5 tokens | 45.74 ms | n=5, spread 28% — **unusable** |
+| Decode step, batch=1, 100 steps | **17.24 ms/step** (58 t/s) | n=5, spread 7.4% |
+| Decode step, batch=1, 20 steps | 18.03 ms/step | n=5, spread 3.7% — **`powersave` governor**, not directly comparable |
+| Prefill slope | **≈ 6.0 ms per prompt token** | fit over 16/64/128/256/512 tokens, n=5 each, R² = 0.995 |
 | Compute buffer | 300.25 MiB | `n_batch=2048` |
 
-**Decode cost grows with sequence length.** The 100-token average is 12% above the 20-token
-average, because each step's attention scans every cached key. So "18 ms/step" is only valid at
-short contexts — Phase 2's cost model needs a length term, not a constant.
+**Decode cost vs context length** (1 decode step taken immediately after an L-token prefill):
 
-**The 5-token prefill is not a usable measurement.** A 28% spread across repeats means it is
-almost entirely fixed overhead with no signal about per-token cost. Needs a 16→1024 prompt-length
-sweep to get a slope.
+| Context | ms/step | MHz during run |
+|---|---|---|
+| 16 | 18.2 | ~3470 |
+| 64 | 18.0 | ~3360 |
+| 128 | 20.2 | ~3450 |
+| 256 | 20.9 | ~3230 |
+| 512 | **29.4** | ~2780 |
+
+Flat to ~64 tokens, then real growth — each step's attention scans every cached key. The 512
+figure is partly confounded: the long prefill preceding it drained the turbo budget (~2780 vs
+~3470 MHz), which explains some but not all of the rise. Phase 2's cost model needs a length
+term either way. An earlier n=1 claim of "20.27 ms/step at 100 tokens, 12% above baseline" did
+**not** reproduce (n=5 gives 17.24) — growth is real but negligible below ~128 tokens.
+
+**Prefill is roughly linear with mild superlinearity.** The least-squares intercept is negative
+(−68 ms), which is the fit absorbing per-token cost that grows with length, not a real negative
+fixed cost. Individual prefill points are noisy (spreads 8–50%; one 992 ms outlier in the
+128-token series against a ~640 ms typical) — the slope is trustworthy, single points are not.
+Prefill at ~6 ms/token vs decode at ~17 ms/token: on this 4-core CPU, prefill's parallelism buys
+only ~3×, nothing like the gap a GPU would show.
 
 ## Not yet measured
 
 - **`-t 3` vs 4 threads.** Every benchmark in this project standardizes on `-t 3` (one core
   reserved for the control plane), but the numbers above are at 4. A slower `-t 3` figure is the
   expected cost of one fewer thread, not a regression.
-- **Decode vs batch size.** The sublinearity that justifies batching at all.
+- **Decode vs batch size.** The sublinearity that justifies batching at all. (Phase 3 — needs
+  multi-sequence support.)
 
 ## Measurement rules learned here
 
