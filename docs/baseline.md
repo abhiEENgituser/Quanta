@@ -51,11 +51,53 @@ fixed cost. Individual prefill points are noisy (spreads 8–50%; one 992 ms out
 Prefill at ~6 ms/token vs decode at ~17 ms/token: on this 4-core CPU, prefill's parallelism buys
 only ~3×, nothing like the gap a GPU would show.
 
+## Phase 1 stack baselines (full HTTP→SSE path, per-run fresh servers)
+
+From `make bench-single`: engine pinned per standing rules (t3 → cores 0-2, t4 → 0-3; control
+plane on core 3), performance governor enforced by the script, 5 runs per cell, fresh shim and
+quantad every run. Raw data: `bench/results/single/`. Values are per-run server-side p50s
+(measured after the admission mutex — no queue wait in them), mean over 5 runs [min–max].
+
+**Prefill (server `ttft_prefill`; includes tokenize+evict RTTs and the first decode step):**
+
+| Prompt | 4 threads | 3 threads | `-t 3` cost |
+|---|---|---|---|
+| ~25 tok | 145 ms [140–151] | 199 ms [182–237] | **+37%** |
+| ~105 tok | 670 ms [562–758] | 876 ms [865–886] | **+31%** |
+| ~425 tok | 2975 ms [2964–3000] | 3484 ms [3412–3615] (n=4) | **+17%** |
+
+**Decode ITL (client-observed, queue-free by construction — the engine is serial):**
+
+| Context ≈ | 4 threads | 3 threads | `-t 3` cost |
+|---|---|---|---|
+| ~40 tok | 17.1 ms [17.0–17.5] | 20.8 ms [19.0–23.5] | **+22%** |
+| ~120 tok | 20.8 ms [17.9–22.0] | 23.9 ms [23.8–24.0] | **+15%** |
+| ~440 tok | 23.8 ms [23.5–23.9] | 26.1 ms [25.8–26.6] (n=4) | **+9%** |
+
+**The `-t 3` reservation gets cheaper as context grows** — decode is increasingly
+memory-bandwidth-bound, so the fourth compute thread is worth less exactly where a serving
+workload spends its time. Reserving a core for the control plane costs ~10-20% in the regime
+that matters, not the naive 33%.
+
+Cross-checks: t4 short-context ITL (17.0-17.5) reproduces the bare-metal 17.24 through the full
+stack; stack prefill slope ≈ 7.1 ms/token vs 6.0 bare-metal (quantad sharing the machine, as
+designed).
+
+**Excluded: `t3_rep85_run1`** — the machine suspended mid-run (screen lock → idle sleep). Its
+engine-side numbers sat mid-pack, but the drift gate flagged it independently: mean drift grew
+453 µs → 156 ms between run halves from the post-resume wakeup. A run the validity gate rejects
+stays rejected, even when its numbers look fine — plausible-but-contaminated is the failure mode
+this project keeps meeting. The t3/~425tok cells above are n=4. (`make bench-single` now holds a
+systemd-inhibit lease so idle-suspend cannot recur mid-session.)
+
+**Caveat on the client-side TTFT columns in those CSVs:** the session ran a fixed 0.5 req/s at
+every prompt length, so utilization varied wildly per cell (~0.35 at short prompts, ~1.6 —
+unstable overload — at ~425 tokens). Client TTFT there measures queue growth, not the engine;
+honest data, wrong label. The engine tables above are queue-free. The script now scales rate
+per prompt length so future TTFT curves are taken at comparable low utilization.
+
 ## Not yet measured
 
-- **`-t 3` vs 4 threads.** Every benchmark in this project standardizes on `-t 3` (one core
-  reserved for the control plane), but the numbers above are at 4. A slower `-t 3` figure is the
-  expected cost of one fewer thread, not a regression.
 - **Decode vs batch size.** The sublinearity that justifies batching at all. (Phase 3 — needs
   multi-sequence support.)
 

@@ -1,0 +1,15 @@
+# governor=performance load=3.52 2.92 2.41 2/1094 105925
+
+=== quanta-bench: rate=0.50 req/s window=2m12s ===
+requests: sent=32 ok=32 failed=0 recorded=28
+cpu MHz during run: mean=0 min=1450
+throughput: 6.8 tokens/s across recorded window
+ttft   n=28    p50=57.671679s p95=1m0.030975s p99=1m0.030975s max=1m0.030975s
+itl    n=868   p50=25.791ms   p95=30.335ms   p99=34.559ms   max=45.631ms
+e2e    n=28    p50=58.458111s p95=1m0.030975s p99=1m0.030975s max=1m0.030975s
+drift  n=28    p50=447µs      p95=959µs      p99=1.087ms    max=1.087ms
+drift: OK (first half 402.139µs, second half 550.352µs)
+
+--- server-side (/v1/metrics; accumulates since quantad start) ---
+{"e2e":{"Count":32,"P50":54394879000,"P95":60030975000,"P99":60030975000,"P999":60030975000,"Max":60030975000,"Saturated":12},"itl":{"Count":992,"P50":25983000,"P95":31487000,"P99":36735000,"P999":40191000,"Max":45631000,"Saturated":0},"ttft":{"Count":32,"P50":53477375000,"P95":60030975000,"P99":60030975000,"P999":60030975000,"Max":60030975000,"Saturated":11},"ttft_prefill":{"Count":32,"P50":3411967000,"P95":3694591000,"P99":3872767000,"P999":3872767000,"Max":3872767000,"Saturated":0},"ttft_queue_wait":{"Count":32,"P50":50135039000,"P95":60030975000,"P99":60030975000,"P999":60030975000,"Max":60030975000,"Saturated":10}}
+

@@ -1,4 +1,15 @@
-.PHONY: build test shim clean lint-clock
+.PHONY: build test shim clean lint-clock bench-single
+
+# Phase 1 exit runs: single-stream baselines across prompt length x threads.
+# Refuses to run under bad conditions (governor, AC, swap). ~30 minutes.
+# systemd-inhibit blocks idle-suspend for the session's duration: a locked
+# screen once suspended the machine mid-run, freezing a run invisibly — the
+# monotonic clock stops during suspend, so the data looks plausible instead
+# of broken, which is the worst kind of wrong.
+bench-single:
+	systemd-inhibit --what=sleep:idle --why="quanta bench run" \
+	  ./bench/configs/bench_single.sh
+	python3 bench/plot/plot_single.py bench/results/single
 
 build:
 	go build ./...

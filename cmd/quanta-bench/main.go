@@ -62,7 +62,7 @@ func main() {
 	promptText := strings.TrimSpace(strings.Repeat(*prompt+" ", *repeat))
 	body, _ := json.Marshal(map[string]any{"prompt": promptText, "max_tokens": *maxTok})
 
-	// Record the conditions the numbers were taken under — a number without
+	// Record the conditions the numbers were taken under a number without
 	// its conditions is not a measurement (see docs/baseline.md).
 	fmt.Fprintf(os.Stderr, "# governor=%s load=%s\n", readFile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"), readFile("/proc/loadavg"))
 
@@ -134,6 +134,20 @@ func main() {
 	writeCSV(*outPath, results)
 	summarize(os.Stderr, reg, results, *rate, wall-*warmup, mhzMean, mhzMin)
 	scrapeServerMetrics(os.Stderr, client, *target)
+
+	// A run in which nothing succeeded must fail loudly. This binary once
+	// exited 0 after 40 seconds of connection-refused — silence read as
+	// success by everything above it.
+	var okRecorded int
+	for _, r := range results {
+		if r.recorded && r.err == nil {
+			okRecorded++
+		}
+	}
+	if okRecorded == 0 {
+		fmt.Fprintln(os.Stderr, "quanta-bench: FAILED — zero successful recorded requests")
+		os.Exit(1)
+	}
 }
 
 // fire sends one request and reads its SSE stream, timestamping every token
