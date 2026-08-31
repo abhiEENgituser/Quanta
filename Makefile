@@ -1,4 +1,17 @@
-.PHONY: build test shim clean lint-clock bench-single
+.PHONY: build test shim clean lint-clock bench-single calibrate validate
+
+# Referee for the cost model: real engine at HELD-OUT prompt lengths vs pure
+# prediction. Exits nonzero if worst end-to-end error exceeds 10%. ~4 minutes.
+validate:
+	systemd-inhibit --what=sleep:idle --why="quanta validation" \
+	  ./bench/configs/validate.sh
+
+# Fit the cost model against the real engine at the standard config (-t 3,
+# pinned). Writes internal/engine/costmodel/params.json — an inspectable
+# artifact, committed, with fit diagnostics embedded. ~4 minutes.
+calibrate:
+	systemd-inhibit --what=sleep:idle --why="quanta calibration" \
+	  ./bench/configs/calibrate.sh
 
 # Phase 1 exit runs: single-stream baselines across prompt length x threads.
 # Refuses to run under bad conditions (governor, AC, swap). ~30 minutes.
