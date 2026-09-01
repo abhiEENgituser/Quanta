@@ -1,23 +1,32 @@
 {
   "prefill": {
-    "intercept_us": -9736.950248756213,
-    "slope_us_per_token": 8355.84394989339,
-    "r2": 0.9997844851163855,
+    "intercept_us": 3483.1442786068656,
+    "slope_us_per_token": 8242.73525230988,
+    "r2": 0.9999514921563476,
     "n_points": 6,
-    "max_abs_residual_us": 43888.100923951715
+    "max_abs_residual_us": 16109.200426439173
   },
   "step": {
-    "intercept_us": 24121.923272374344,
-    "slope_us_per_token": 9.020553706661275,
-    "r2": 0.7636939195512514,
+    "intercept_us": 24919.917467094143,
+    "slope_us_per_token": 4.678071681864986,
+    "r2": 0.4469773687650873,
     "n_points": 136,
-    "max_abs_residual_us": 3179.67110277374
+    "max_abs_residual_us": 3828.062310768044
   },
+  "step_batch": {
+    "intercept_us": 14653.666666666664,
+    "slope_us_per_token": 10882.857142857143,
+    "r2": 0.9610301483431936,
+    "n_points": 6,
+    "max_abs_residual_us": 5168.761904761908
+  },
+  "batch_ref_ctx": 128,
   "meta": {
-    "fitted_at": "2026-08-31T16:25:15+05:30",
+    "fitted_at": "2026-09-01T13:14:28+05:30",
     "source": "quanta-calibrate v2: lengths=16,32,64,128,256,512, steps=24, sweeps=3, thermal-warmup=1m0s, shuffled order, per-x medians",
     "engine_args": "-t 3, engine cores 0-2, calibrator core 3, governor performance",
-    "mhz_mean": 2327.9404278846155,
-    "mhz_min": 1712.455
+    "mhz_mean": 2153.119583333334,
+    "mhz_min": 1449.802875,
+    "notes": " | batch sweep: B=1..6 at ctx=128, 3 sweeps, 2026-09-01T13:16:45+05:30"
   }
 }

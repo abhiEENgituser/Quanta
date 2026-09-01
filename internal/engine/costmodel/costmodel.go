@@ -51,6 +51,12 @@ type Params struct {
 	Prefill Line `json:"prefill"`
 	// Single decode-step duration as a function of current context length.
 	Step Line `json:"step"`
+	// Batched decode-step duration as a function of batch size, measured at
+	// BatchRefCtx tokens of context per sequence. The sublinearity of this
+	// line versus B × Step is the entire economic case for batching.
+	// Optional until the batch sweep has run (Phase 3).
+	StepBatch   Line `json:"step_batch,omitempty"`
+	BatchRefCtx int  `json:"batch_ref_ctx,omitempty"`
 
 	Meta struct {
 		FittedAt   string  `json:"fitted_at"`

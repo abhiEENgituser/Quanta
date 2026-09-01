@@ -531,8 +531,8 @@ graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n
 sched_reserve:        CPU compute buffer size =   300.25 MiB
 sched_reserve: graph nodes  = 822
 sched_reserve: graph splits = 1
-sched_reserve: reserve took 4.46 ms, sched copies = 1
+sched_reserve: reserve took 5.08 ms, sched copies = 1
 quanta_shim: model loaded, vocab=151936, n_ctx=2048, threads=3, seqs=1 (2048 ctx/seq)
-quanta_shim: listening on /tmp/quanta-validate.sock
+quanta_shim: listening on /tmp/quanta-calibrate.sock
 quanta_shim: client connected
 quanta_shim: client disconnected

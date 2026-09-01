@@ -169,19 +169,28 @@ static std::string base64_encode(const uint8_t * data, size_t len) {
 // Engine state
 // ---------------------------------------------------------------------------
 
+// Logits live only until the next llama_decode call — ANY next call, for any
+// sequence. Holding a logits index across calls is therefore a use-after-
+// invalidate bug the moment two sequences interleave (prefill A, prefill B:
+// B's decode destroys A's pending logits — found the hard way, as an abort in
+// llama_sampler_sample). So the shim samples EAGERLY, immediately after every
+// decode while the logits are fresh, and stores the resulting pending TOKEN.
+// A token id cannot go stale; a logits index can.
 struct seq_state {
-    llama_pos next_pos   = 0;   // absolute position the next token will occupy
-    int32_t   logits_idx = -1;  // output index holding this sequence's pending logits
-    bool      prefilled  = false;
+    llama_pos   next_pos    = 0;     // absolute position the next token will occupy
+    llama_token pending     = -1;    // sampled but not yet emitted by a step
+    bool        has_pending = false;
+    bool        prefilled   = false;
 };
 
 struct engine {
-    llama_model       * model = nullptr;
-    const llama_vocab * vocab = nullptr;
-    llama_context     * ctx   = nullptr;
-    llama_sampler     * smpl  = nullptr;
-    llama_batch         batch = {};
-    int                 n_ctx = 0;
+    llama_model       * model  = nullptr;
+    const llama_vocab * vocab  = nullptr;
+    llama_context     * ctx    = nullptr;
+    llama_sampler     * smpl   = nullptr;
+    llama_batch         batch  = {};
+    int                 n_ctx  = 0;
+    int                 n_seqs = 1;
 
     // The shim owns each sequence's position because building a batch requires
     // it. Go keeps its own accounting and verifies against pos_range rather than
@@ -191,6 +200,21 @@ struct engine {
 
 static json make_error(const std::string & msg) {
     return json{{"ok", false}, {"error", msg}};
+}
+
+// A seq id outside [0, n_seqs) does not error inside llama.cpp — it ABORTS
+// (GGML_ASSERT in llama_kv_cache::seq_rm and friends). These ids arrive over
+// a socket, so an unchecked one is a remote kill switch for the server. Every
+// handler that touches a sequence bounces bad ids here, before llama.cpp can
+// see them.
+static bool seq_in_range(const engine & eng, llama_seq_id seq) {
+    return seq >= 0 && seq < static_cast<llama_seq_id>(eng.n_seqs);
+}
+
+static json seq_range_error(const engine & eng, llama_seq_id seq) {
+    return make_error("sequence " + std::to_string(seq) + " out of range [0," +
+                      std::to_string(eng.n_seqs) + ") — shim started with -q " +
+                      std::to_string(eng.n_seqs));
 }
 
 // Decode one token id to its raw bytes. llama_token_to_piece returns a negative
@@ -270,6 +294,9 @@ static json handle_prefill(engine & eng, const json & req) {
     }
 
     const llama_seq_id seq = req["seq"].get<llama_seq_id>();
+    if (!seq_in_range(eng, seq)) {
+        return seq_range_error(eng, seq);
+    }
 
     std::vector<llama_token> toks;
     for (const auto & t : req["tokens"]) {
@@ -318,11 +345,13 @@ static json handle_prefill(engine & eng, const json & req) {
     st.next_pos  = start_pos + static_cast<llama_pos>(toks.size());
     st.prefilled = true;
 
-    // llama_get_logits_ith() indexes by BATCH position, not by output ordinal —
-    // internally it resolves output_ids[i], which is -1 for any token that did
-    // not request logits. So this is the batch slot of the final token, and
-    // passing 0 here would resolve to -1 and return a null logits pointer.
-    st.logits_idx = static_cast<int32_t>(toks.size()) - 1;
+    // Sample NOW, while this decode's logits are still the current ones — the
+    // next decode call for any sequence destroys them. The index is the batch
+    // slot of the final token (llama_get_logits_ith resolves by batch
+    // position, not output ordinal — that lesson stays load-bearing).
+    st.pending     = llama_sampler_sample(eng.smpl, eng.ctx,
+                                          static_cast<int32_t>(toks.size()) - 1);
+    st.has_pending = true;
 
     return json{{"ok", true}};
 }
@@ -330,8 +359,10 @@ static json handle_prefill(engine & eng, const json & req) {
 // step: advance every listed sequence by exactly one decode pass. Go decides who
 // is active and when to call; the shim never chooses.
 //
-// Shape matches probe.cpp: prefill leaves logits ready, then each step samples
-// from what is available and decodes the sampled token to prepare the next.
+// Emit-decode-sample: each sequence's PENDING token (sampled eagerly while its
+// logits were fresh) is emitted, the pending tokens form the next batch, one
+// decode advances everyone, and new pendings are sampled immediately from the
+// just-computed logits — before any other call can invalidate them.
 static json handle_step(engine & eng, const json & req) {
     if (!req.contains("active") || !req["active"].is_array()) {
         return make_error("step: 'active' must be an array");
@@ -342,7 +373,11 @@ static json handle_step(engine & eng, const json & req) {
         if (!s.is_number_integer()) {
             return make_error("step: 'active' must contain only integers");
         }
-        active.push_back(s.get<llama_seq_id>());
+        const llama_seq_id seq = s.get<llama_seq_id>();
+        if (!seq_in_range(eng, seq)) {
+            return seq_range_error(eng, seq);
+        }
+        active.push_back(seq);
     }
 
     if (active.empty()) {
@@ -359,8 +394,8 @@ static json handle_step(engine & eng, const json & req) {
         if (it == eng.seqs.end() || !it->second.prefilled) {
             return make_error("step: sequence " + std::to_string(seq) + " has not been prefilled");
         }
-        if (it->second.logits_idx < 0) {
-            return make_error("step: sequence " + std::to_string(seq) + " has no pending logits");
+        if (!it->second.has_pending) {
+            return make_error("step: sequence " + std::to_string(seq) + " has no pending token (finished or invalidated — prefill again)");
         }
         if (it->second.next_pos >= eng.n_ctx) {
             return make_error("step: sequence " + std::to_string(seq) + " would exceed n_ctx");
@@ -371,13 +406,16 @@ static json handle_step(engine & eng, const json & req) {
 
     eng.batch.n_tokens = 0;
 
-    struct pending { llama_seq_id seq; int32_t idx; };
-    std::vector<pending> to_update;
+    struct slot_owner { llama_seq_id seq; int32_t slot; };
+    std::vector<slot_owner> owners;
 
+    // Phase 1: emit each sequence's pending token and, unless it finished,
+    // give that token a slot in the next batch.
     for (const llama_seq_id seq : active) {
         seq_state & st = eng.seqs[seq];
 
-        const llama_token tok = llama_sampler_sample(eng.smpl, eng.ctx, st.logits_idx);
+        const llama_token tok = st.pending;
+        st.has_pending = false;
 
         std::string bytes;
         if (!token_bytes(eng, tok, bytes)) {
@@ -398,7 +436,6 @@ static json handle_step(engine & eng, const json & req) {
         // more. Length caps, timeouts and cancellation are policy and belong to
         // Go — a shim that stopped a sequence itself would be scheduling.
         if (finished) {
-            st.logits_idx = -1;
             continue;
         }
 
@@ -410,13 +447,12 @@ static json handle_step(engine & eng, const json & req) {
         eng.batch.seq_id[slot][0] = seq;
         eng.batch.logits[slot]    = true;
 
-        // The batch slot IS the logits index — llama_get_logits_ith() resolves
-        // output_ids[slot] internally. Tracking it per sequence, rather than
-        // passing -1 for "the last output", is what makes this correct once
-        // more than one sequence is in flight.
-        to_update.push_back({seq, slot});
+        owners.push_back({seq, slot});
     }
 
+    // Phase 2: one decode advances every non-finished sequence, then new
+    // pending tokens are sampled IMMEDIATELY — these logits die at the next
+    // decode call, whoever makes it.
     if (eng.batch.n_tokens > 0) {
         const int32_t rc = llama_decode(eng.ctx, eng.batch);
         if (rc != 0) {
@@ -425,8 +461,12 @@ static json handle_step(engine & eng, const json & req) {
             return err;
         }
 
-        for (const auto & p : to_update) {
-            eng.seqs[p.seq].logits_idx = p.idx;
+        for (const auto & o : owners) {
+            seq_state & st = eng.seqs[o.seq];
+            // Batch slot, not output ordinal — llama_get_logits_ith resolves
+            // output_ids[slot] internally.
+            st.pending     = llama_sampler_sample(eng.smpl, eng.ctx, o.slot);
+            st.has_pending = true;
         }
     }
 
@@ -442,6 +482,9 @@ static json handle_evict(engine & eng, const json & req) {
     }
 
     const llama_seq_id seq = req["seq"].get<llama_seq_id>();
+    if (!seq_in_range(eng, seq)) {
+        return seq_range_error(eng, seq);
+    }
     const llama_pos    p0  = req.value("p0", 0);
     const llama_pos    p1  = req.value("p1", -1);
 
@@ -461,9 +504,9 @@ static json handle_evict(engine & eng, const json & req) {
                 eng.seqs.erase(it);
             } else {
                 // A partial evict leaves the cache in a state our cached
-                // logits_idx no longer describes. Rather than guess, invalidate:
+                // pending token no longer describes. Rather than guess, invalidate:
                 // Go must prefill again before stepping this sequence.
-                it->second.logits_idx = -1;
+                it->second.has_pending = false;
                 if (p1 < 0 && p0 >= 0) {
                     it->second.next_pos = p0;
                 }
@@ -483,6 +526,9 @@ static json handle_pos_range(engine & eng, const json & req) {
     }
 
     const llama_seq_id seq = req["seq"].get<llama_seq_id>();
+    if (!seq_in_range(eng, seq)) {
+        return seq_range_error(eng, seq);
+    }
     llama_memory_t     mem = llama_get_memory(eng.ctx);
 
     return json{
@@ -562,6 +608,11 @@ int main(int argc, char ** argv) {
     const char * model_path = nullptr;
     const char * sock_path  = DEFAULT_SOCKET_PATH;
     int          n_ctx      = DEFAULT_N_CTX;
+    int          n_threads  = 0;   // 0 = llama.cpp default (GGML_DEFAULT_N_THREADS = 4)
+    int          n_seqs     = 1;   // max concurrent sequences. NOTE: llama.cpp
+                                   // DIVIDES n_ctx among sequences — n_ctx 2048
+                                   // with -q 8 gives each sequence a 256-token
+                                   // window. That division IS the KV budget.
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -570,14 +621,18 @@ int main(int argc, char ** argv) {
             sock_path = argv[++i];
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             n_ctx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            n_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
+            n_seqs = atoi(argv[++i]);
         } else {
-            fprintf(stderr, "usage: %s -m <model.gguf> [-s socket_path] [-c n_ctx]\n", argv[0]);
+            fprintf(stderr, "usage: %s -m <model.gguf> [-s socket_path] [-c n_ctx] [-t threads] [-q max_seqs]\n", argv[0]);
             return 1;
         }
     }
 
-    if (model_path == nullptr || n_ctx <= 0) {
-        fprintf(stderr, "usage: %s -m <model.gguf> [-s socket_path] [-c n_ctx]\n", argv[0]);
+    if (model_path == nullptr || n_ctx <= 0 || n_threads < 0 || n_seqs < 1) {
+        fprintf(stderr, "usage: %s -m <model.gguf> [-s socket_path] [-c n_ctx] [-t threads] [-q max_seqs]\n", argv[0]);
         return 1;
     }
 
@@ -592,7 +647,8 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     engine eng;
-    eng.n_ctx = n_ctx;
+    eng.n_ctx  = n_ctx;
+    eng.n_seqs = n_seqs;
 
     llama_model_params model_params = llama_model_default_params();
     eng.model = llama_model_load_from_file(model_path, model_params);
@@ -605,8 +661,17 @@ int main(int argc, char ** argv) {
     eng.vocab = llama_model_get_vocab(eng.model);
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx   = static_cast<uint32_t>(n_ctx);
-    ctx_params.n_batch = static_cast<uint32_t>(n_ctx);
+    ctx_params.n_ctx     = static_cast<uint32_t>(n_ctx);
+    ctx_params.n_batch   = static_cast<uint32_t>(n_ctx);
+    ctx_params.n_seq_max = static_cast<uint32_t>(n_seqs);
+    if (n_threads > 0) {
+        // Both pools: n_threads drives decode (one token per sequence),
+        // n_threads_batch drives prefill (many tokens at once). The -t 3 rule
+        // reserves one core for the control plane, and it must apply to both
+        // phases or the comparison measures a mixture.
+        ctx_params.n_threads       = n_threads;
+        ctx_params.n_threads_batch = n_threads;
+    }
 
     eng.ctx = llama_init_from_model(eng.model, ctx_params);
     if (eng.ctx == nullptr) {
@@ -627,8 +692,10 @@ int main(int argc, char ** argv) {
 
     eng.batch = llama_batch_init(n_ctx, 0, 1);
 
-    fprintf(stderr, "quanta_shim: model loaded, vocab=%d, n_ctx=%d\n",
-            llama_vocab_n_tokens(eng.vocab), n_ctx);
+    fprintf(stderr, "quanta_shim: model loaded, vocab=%d, n_ctx=%d, threads=%d, seqs=%d (%d ctx/seq)\n",
+            llama_vocab_n_tokens(eng.vocab), n_ctx,
+            n_threads > 0 ? n_threads : -1 /* -1 = library default (4) */,
+            n_seqs, n_ctx / n_seqs);
 
     // ---- socket setup
 

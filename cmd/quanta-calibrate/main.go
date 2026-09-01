@@ -40,14 +40,23 @@ import (
 func main() {
 	var (
 		socket  = flag.String("socket", "/tmp/quanta.sock", "shim unix socket")
-		lengths = flag.String("lengths", "16,32,64,128,256,512", "prompt token lengths")
+		mode    = flag.String("mode", "lines", "lines: prefill/step vs length | batch: step vs batch size")
+		lengths = flag.String("lengths", "16,32,64,128,256,512", "prompt token lengths (mode=lines)")
 		steps   = flag.Int("steps", 24, "decode steps measured per length")
 		sweeps  = flag.Int("sweeps", 3, "recorded sweeps (after thermal warmup)")
 		warmFor = flag.Duration("thermal-warmup", 60*time.Second, "sustained load before recording")
 		out     = flag.String("out", "internal/engine/costmodel/params.json", "output path")
 		args    = flag.String("engine-args", "", "engine config recorded in meta")
+
+		batchMax    = flag.Int("batch-max", 6, "largest batch size (mode=batch; shim needs -q >= this)")
+		batchPrompt = flag.Int("batch-prompt", 128, "prompt tokens per sequence (mode=batch)")
 	)
 	flag.Parse()
+
+	if *mode == "batch" {
+		runBatchMode(*socket, *out, *batchMax, *batchPrompt, *steps, *sweeps, *warmFor)
+		return
+	}
 
 	var lens []int
 	for _, s := range strings.Split(*lengths, ",") {

@@ -71,6 +71,51 @@ step(ctx)  = 24122us + 9.02us·ctx    R² = 0.7637   max|res| = 3.2ms
   wrong — they describe different thermal regimes, and the model deliberately
   describes the serving regime.
 
+## The batch curve (Phase 3): sublinearity quantified
+
+One `llama_decode` advancing B sequences at once, B = 1..6, at a fixed
+128-token context per sequence (fixed on purpose: step cost also grows with
+ctx, and letting both vary in one sweep would confound them — the v1 lesson,
+applied). Shim at `-q 6`; note llama.cpp divides `n_ctx` among sequence slots.
+
+```
+step_batch(B) = 14654us + 10883us·B    R² = 0.961    (at ctx≈128)
+
+batch   cost/call   cost/sequence   vs B×solo
+  1       25.7ms        25.7ms        100%
+  2       32.8ms        16.4ms         64%
+  4       55.0ms        13.7ms         54%
+  6       76.7ms        12.8ms         50%
+```
+
+**Batch 6 costs 50% of six separate calls — batching doubles throughput on
+this hardware.** The decomposition: ~14.7 ms fixed per call (the shared weight
+read and dispatch) + ~10.9 ms per sequence. The asymptotic ceiling is
+slope/solo ≈ 42%, i.e. **~2.4× maximum batching gain on this CPU** — modest
+against GPU serving stacks (whose per-sequence slope is tiny relative to the
+fixed cost, hence 10–20× gains) because a 4-core CPU is partly compute-bound
+even in decode. Same physics, different constants.
+
+Observed artifact, unexplained: cost grows in steps of two — large jumps at
+B 2→3 (+20ms) and 4→5 (+19ms), near-flat at 3→4 and 5→6. Presumably a kernel
+tiling or thread work-split granularity at `-t 3`. If it holds, even batch
+sizes are better value than odd. Worth a look someday; the line fits anyway.
+
+How the synthetic backend prices a batched step: `StepBatch.At(B)` plus the
+Step line's per-token slope applied to aggregate context deviation from the
+128-token calibration reference. That correction leans on the least-stable
+coefficient (below); it amounts to a few percent on top of stable intercepts.
+
+## Known instability: the step-vs-ctx slope
+
+Two calibrations produced slopes of 9.0 and 4.7 µs/ctx (intercepts stable:
+24.1 vs 24.9 ms). Across ctx 16→535 the slope contributes only ~2–5 ms of
+signal against ±3–4 ms of per-step jitter at hot steady state — **weakly
+identified on this hardware at these lengths**. The effect itself is real
+(Phase 1 stack ITL grew 17→24 ms over ctx 40→440, unambiguously). Validation
+passes with either coefficient because the intercepts dominate; treat
+absolute step predictions at extreme contexts with corresponding suspicion.
+
 ## Validation: held-out lengths, hard threshold
 
 `make validate` measures the real engine at prompt lengths **24/96/192/384 —
@@ -81,12 +126,16 @@ gaps tests the claim that cost is actually linear. Exit code is the verdict
 
 | length | measured | predicted | error |
 |---|---|---|---|
-| 24 | 1071.4 ms | 974.1 ms | −9.1% |
-| 96 | 1702.9 ms | 1596.5 ms | −6.3% |
-| 192 | 2545.8 ms | 2426.4 ms | −4.7% |
-| 384 | 4204.5 ms | 4086.1 ms | −2.8% |
+| 24 | 1015.7 ms | 1004.6 ms | −1.1% |
+| 96 | 1646.9 ms | 1608.9 ms | −2.3% |
+| 192 | 2468.5 ms | 2414.6 ms | −2.2% |
+| 384 | 4364.5 ms | 4025.9 ms | −7.8% |
 
-**PASSED** (worst −9.1%, mean 5.7%). Plot: `bench/results/validation.png`.
+**PASSED** (worst −7.8%, mean 3.3%). Plot: `bench/results/validation.png`.
+An earlier calibration also passed (worst −9.1%, mean 5.7%) with the error
+pattern inverted — worst at short prompts instead of long. The two runs
+bracket reality from opposite sides, which is what "a ±5–8% model" means in
+practice.
 
 Two properties of the error worth knowing when reading simulated results:
 

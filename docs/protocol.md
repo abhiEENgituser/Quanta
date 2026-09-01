@@ -270,6 +270,20 @@ fallback path (evict the whole sequence when a partial evict is refused) plus a 
 often it fires costs almost nothing to write now and means the block manager doesn't silently
 break the day a recurrent-family model gets swapped in.
 
+## Constraint 3 — logits live only until the next `llama_decode` call
+
+The output buffer holds logits for the MOST RECENT batch only; any subsequent
+`llama_decode` — for any sequence — invalidates them (in a Release build the
+symptom is `get_logits_ith: invalid logits id` followed by an abort inside
+`llama_sampler_sample`). Found the hard way when two sequences interleaved:
+prefill A, prefill B, then stepping A tried to sample from logits B's decode
+had already destroyed. Single-sequence code never notices, because there the
+last decode is always your own.
+
+Consequence for the shim's design: never hold a logits index across calls.
+Sample eagerly — immediately after the decode that produced the logits — and
+store the resulting pending TOKEN per sequence. Token ids cannot go stale.
+
 ## Constraint 2 — `seq_cp` returns `void`, with no failure signal at all
 
 Unlike `seq_rm`, there's no way to ask "did the copy actually happen." The documented mitigation

@@ -29,12 +29,25 @@ cmake --build shim/build -j3 >/dev/null
 cleanup() { [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null || true; wait 2>/dev/null || true; }
 trap cleanup EXIT
 
-rm -f "$SOCK"
-taskset -c 0-2 ./shim/build/quanta_shim -m "$MODEL" -s "$SOCK" -t 3 2>bench/results/calibrate_shim.log &
-SPID=$!
-for _ in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.1; done
-[ -S "$SOCK" ] || { echo "FATAL: shim never bound (bench/results/calibrate_shim.log)" >&2; exit 1; }
+start_shim() {  # $1 = -q value, $2 = log suffix
+    [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null && wait 2>/dev/null || true
+    rm -f "$SOCK"
+    taskset -c 0-2 ./shim/build/quanta_shim -m "$MODEL" -s "$SOCK" -t 3 -q "$1" \
+        2>"bench/results/calibrate_shim_$2.log" &
+    SPID=$!
+    for _ in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    [ -S "$SOCK" ] || { echo "FATAL: shim never bound (calibrate_shim_$2.log)" >&2; exit 1; }
+}
 
-taskset -c 3 bench/bin/quanta-calibrate \
+# Phase A — the per-length lines. Needs big per-sequence windows (prefill up
+# to 512 tokens), so a single sequence slot: -q 1 keeps the full 2048 window.
+start_shim 1 lines
+taskset -c 3 bench/bin/quanta-calibrate -mode lines \
     -socket "$SOCK" \
     -engine-args "-t 3, engine cores 0-2, calibrator core 3, governor performance"
+
+# Phase B — the batch curve. Needs 6 sequence slots; n_ctx divides, giving
+# each sequence a 341-token window — plenty for a 128-token prompt + steps.
+start_shim 6 batch
+taskset -c 3 bench/bin/quanta-calibrate -mode batch \
+    -socket "$SOCK" -batch-max 6 -batch-prompt 128 -thermal-warmup 45s

@@ -65,13 +65,59 @@ func TestMockModeActuallySleeps(t *testing.T) {
 	}
 }
 
-func TestRefusesUncalibratedBatch(t *testing.T) {
-	be := New(clock.NewVirtual(time.Unix(0, 0)), testParams())
+func TestRefusesBatchWithoutBatchCurve(t *testing.T) {
+	p := testParams()
+	p.StepBatch = costmodel.Line{} // params predate the Phase 3 batch sweep
+	be := New(clock.NewVirtual(time.Unix(0, 0)), p)
 	_ = be.Prefill(0, []int32{1}, 0)
 	_ = be.Prefill(1, []int32{1}, 0)
 
 	if _, err := be.Step([]engine.SeqID{0, 1}); err == nil {
-		t.Fatal("multi-sequence step must be refused until the batch curve is calibrated")
+		t.Fatal("multi-sequence step must be refused when params carry no batch curve")
+	}
+}
+
+// Batched pricing is exact arithmetic on the two calibrated lines: the batch
+// line at B, plus the step slope applied to aggregate context deviation from
+// the calibration reference.
+func TestBatchedStepCost(t *testing.T) {
+	p := testParams()
+	p.StepBatch = costmodel.Line{InterceptUS: 15_000, SlopeUS: 11_000, N: 18, R2: 1}
+	p.BatchRefCtx = 128
+
+	v := clock.NewVirtual(time.Unix(0, 0))
+	be := New(v, p)
+
+	// Three sequences prefilled to exactly the reference context: the ctx
+	// correction is zero, so one batched step costs exactly StepBatch.At(3).
+	for seq := engine.SeqID(0); seq < 3; seq++ {
+		if err := be.Prefill(seq, make([]int32, 128), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := v.Now()
+	if _, err := be.Step([]engine.SeqID{0, 1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	want := 48 * time.Millisecond // 15ms + 11ms*3
+	if got := v.Now().Sub(before); got != want {
+		t.Fatalf("batch-3 step at ref ctx cost %v, want exactly %v", got, want)
+	}
+
+	// The next step runs at ctx 129 each: aggregate deviation = 3 tokens over
+	// reference, so cost = StepBatch.At(3) + 3 * stepSlope (10us).
+	before = v.Now()
+	if _, err := be.Step([]engine.SeqID{0, 1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	want = 48*time.Millisecond + 30*time.Microsecond
+	if got := v.Now().Sub(before); got != want {
+		t.Fatalf("ctx-adjusted batch step cost %v, want exactly %v", got, want)
+	}
+
+	// Every sequence advanced: three tokens per step, one each.
+	if min, max, _ := be.PosRange(1); min != 0 || max != 129 {
+		t.Fatalf("seq 1 PosRange = [%d,%d], want [0,129]", min, max)
 	}
 }
 

@@ -20,6 +20,7 @@ package synthetic
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/abhiEENgituser/Quanta/internal/clock"
 	"github.com/abhiEENgituser/Quanta/internal/engine"
@@ -103,37 +104,65 @@ func (b *Backend) Step(active []engine.SeqID) (engine.StepResult, error) {
 	if len(active) == 0 {
 		return engine.StepResult{}, fmt.Errorf("synthetic: step: empty active set")
 	}
-	if len(active) > 1 {
-		// The batch-size cost curve does not exist yet (Phase 3 calibrates
-		// it). Guessing here would produce confident nonsense about exactly
-		// the question the project exists to answer.
+	if len(active) > 1 && b.p.StepBatch.N == 0 {
+		// No batch curve in the params file — refuse rather than guess. A cost
+		// model that invents numbers outside its calibration is how
+		// simulations lie about exactly the question they exist to answer.
 		return engine.StepResult{}, fmt.Errorf(
-			"synthetic: step: %d sequences, but the batch cost curve is not calibrated yet (Phase 3)",
+			"synthetic: step: %d sequences, but params carry no batch curve (run make calibrate)",
 			len(active))
 	}
-	seq := active[0]
 
 	b.mu.Lock()
-	st, ok := b.seqs[seq]
-	if !ok {
-		b.mu.Unlock()
-		return engine.StepResult{}, fmt.Errorf("synthetic: step: sequence %d not prefilled", seq)
+	res := engine.StepResult{Tokens: make([]engine.Token, 0, len(active))}
+	var ctxSum int32
+	for _, seq := range active {
+		st, ok := b.seqs[seq]
+		if !ok {
+			b.mu.Unlock()
+			return engine.StepResult{}, fmt.Errorf("synthetic: step: sequence %d not prefilled", seq)
+		}
+		ctx := st.nextPos // tokens cached when this step runs
+		ctxSum += ctx
+		st.nextPos++
+
+		// Deterministic fake token: id is the position it landed at. Finished
+		// is never set — output length is policy, owned above this interface.
+		res.Tokens = append(res.Tokens, engine.Token{
+			Seq:   seq,
+			ID:    ctx,
+			Piece: []byte(fmt.Sprintf(" t%d", ctx)),
+		})
 	}
-	ctx := st.nextPos // tokens cached when this step runs — same x the calibration measured
-	st.nextPos++
 	b.mu.Unlock()
 
-	b.clk.Sleep(b.p.Step.At(float64(ctx)))
+	b.clk.Sleep(b.stepCost(len(active), ctxSum))
+	return res, nil
+}
 
-	// Deterministic fake token: id is the position it landed at, text is a
-	// legible placeholder. Finished is never set — output length is policy,
-	// decided above the Backend interface, and the fake has no EOG opinion.
-	piece := fmt.Sprintf(" t%d", ctx)
-	return engine.StepResult{Tokens: []engine.Token{{
-		Seq:   seq,
-		ID:    ctx,
-		Piece: []byte(piece),
-	}}}, nil
+// stepCost prices one decode call. Composed from the two calibrated lines:
+//
+//	B == 1: the validated Step line, cost(ctx) directly.
+//	B >= 2: the batch line at B — measured at BatchRefCtx per sequence — plus
+//	        the Step line's per-cached-token slope applied to how far the
+//	        actual contexts deviate from that reference in aggregate.
+//
+// The ctx correction leans on the least-stable fitted coefficient (the step
+// slope varied 4.7-9.0 us/tok across calibrations), but it is a correction of
+// a few percent on top of intercepts that are stable and validated —
+// docs/costmodel.md carries the caveat.
+func (b *Backend) stepCost(batch int, ctxSum int32) time.Duration {
+	if batch == 1 {
+		return b.p.Step.At(float64(ctxSum))
+	}
+	base := b.p.StepBatch.At(float64(batch))
+	refSum := float64(batch * b.p.BatchRefCtx)
+	adjUS := b.p.Step.SlopeUS * (float64(ctxSum) - refSum)
+	d := base + time.Duration(adjUS)*time.Microsecond
+	if d < 0 {
+		d = 0
+	}
+	return d
 }
 
 func (b *Backend) Evict(seq engine.SeqID, p0, p1 int32) (bool, error) {
